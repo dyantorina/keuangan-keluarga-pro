@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
+from google import genai
 from google.oauth2.service_account import Credentials
 
 # ==========================================
@@ -201,7 +202,7 @@ KATEGORI_PENGELUARAN = [
 
 
 # ==========================================
-# FUNGSI BANTUAN FORMAT, INPUT & PRINT
+# FUNGSI BANTUAN FORMAT, INPUT, PRINT & PREDIKSI
 # ==========================================
 def format_rp(angka: float) -> str:
     return f"Rp {angka:,.0f}".replace(",", ".")
@@ -319,6 +320,42 @@ def buat_tombol_print(df_cetak: pd.DataFrame, username: str, tgl_mulai: date, tg
         """,
         height=48,
     )
+
+
+def hitung_proyeksi_3_tahun(
+    aset_awal: float,
+    hutang_awal: float,
+    pendapatan_bln: float,
+    pengeluaran_bln: float,
+    cicilan_bln: float,
+    return_tahunan_persen: float,
+) -> pd.DataFrame:
+    """Simulasi tren bulanan selama 36 bulan (3 tahun)."""
+    r_bulanan = (return_tahunan_persen / 100.0) / 12.0
+    aset = float(aset_awal)
+    hutang = float(hutang_awal)
+
+    mulai = pd.Timestamp.today().replace(day=1)
+    hasil = []
+
+    for m in range(37):  # Bulan 0 (sekarang) s.d. Bulan 36
+        tgl_label = (mulai + pd.DateOffset(months=m)).strftime("%b %Y")
+        hasil.append(
+            {
+                "Bulan Ke": m,
+                "Periode": tgl_label,
+                "Total Aset": round(aset, 0),
+                "Sisa Hutang": round(hutang, 0),
+                "Kekayaan Bersih": round(aset - hutang, 0),
+            }
+        )
+        # Update untuk bulan berikutnya
+        bayar_hutang_aktual = min(hutang, cicilan_bln)
+        hutang = max(0.0, hutang - bayar_hutang_aktual)
+        arus_kas_bersih = pendapatan_bln - pengeluaran_bln - bayar_hutang_aktual
+        aset = max(0.0, aset * (1.0 + r_bulanan) + arus_kas_bersih)
+
+    return pd.DataFrame(hasil)
 
 
 # ==========================================
@@ -462,13 +499,14 @@ st.divider()
 # ==========================================
 # TAB NAVIGASI UTAMA
 # ==========================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "🏦 Saldo & Aset",
         "➕ Catat Transaksi",
         "🧾 Manajemen Hutang",
         "📊 Grafik & Analisis",
         "📋 Riwayat, Print & Hapus",
+        "🔮 Prediksi 3 Tahun & AI",
     ]
 )
 
@@ -951,7 +989,6 @@ with tab5:
     else:
         df_view = df_transaksi.copy()
 
-        # Filter rentang tanggal (default 30 hari terakhir)
         hari_ini = date.today()
         default_awal = hari_ini - timedelta(days=29)
 
@@ -984,7 +1021,6 @@ with tab5:
             if df_view.empty:
                 st.info("Tidak ada transaksi pada rentang tanggal & filter yang dipilih.")
             else:
-                # Ringkasan periode terpilih
                 p_masuk = df_view[df_view["jenis"] == "Pendapatan"]["nominal"].sum()
                 p_keluar = df_view[df_view["jenis"] == "Pengeluaran"]["nominal"].sum()
                 m1, m2, m3 = st.columns(3)
@@ -1011,7 +1047,6 @@ with tab5:
                     hide_index=True,
                 )
 
-                # Tombol Print & Download CSV
                 btn_c1, btn_c2 = st.columns([1, 1])
                 with btn_c1:
                     buat_tombol_print(df_view, CURRENT_USER, tgl_mulai, tgl_selesai)
@@ -1035,3 +1070,157 @@ with tab5:
                     save_user_df("transaksi", df_transaksi, KOLOM_TRANSAKSI, CURRENT_USER)
                     st.success(f"Transaksi ID `{id_hapus}` berhasil dihapus.")
                     st.rerun()
+
+# --- TAB 6: PREDIKSI 3 TAHUN & ANALISIS GEMINI AI ---
+with tab6:
+    st.subheader("🔮 Proyeksi Tren Keuangan 3 Tahun ke Depan (36 Bulan)")
+    st.caption(
+        "Simulasi ini menggunakan total aset dan sisa hutang saat ini sebagai titik awal, "
+        "lalu memproyeksikan tren bulanan berdasarkan asumsi arus kas dan return investasi."
+    )
+
+    # Hitung rata-rata bulanan otomatis dari data transaksi (jika sudah ada)
+    default_pendapatan_bln = 10000000.0
+    default_pengeluaran_bln = 6000000.0
+    if not df_transaksi.empty:
+        df_trx_tmp = df_transaksi.copy()
+        df_trx_tmp["bulan"] = pd.to_datetime(df_trx_tmp["tanggal"]).dt.to_period("M")
+        jml_bulan = max(1, df_trx_tmp["bulan"].nunique())
+        rata_masuk = df_trx_tmp[df_trx_tmp["jenis"] == "Pendapatan"]["nominal"].sum() / jml_bulan
+        rata_keluar = df_trx_tmp[df_trx_tmp["jenis"] == "Pengeluaran"]["nominal"].sum() / jml_bulan
+        if rata_masuk > 0:
+            default_pendapatan_bln = rata_masuk
+        if rata_keluar > 0:
+            default_pengeluaran_bln = rata_keluar
+
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        est_pendapatan = input_nominal(
+            "Estimasi Pendapatan / Bulan (Rp)",
+            value=default_pendapatan_bln,
+            key="est_pendapatan_3th",
+        )
+    with p2:
+        est_pengeluaran = input_nominal(
+            "Estimasi Pengeluaran / Bulan (Rp)",
+            value=default_pengeluaran_bln,
+            key="est_pengeluaran_3th",
+            help="Pengeluaran rutin di luar cicilan hutang di samping.",
+        )
+    with p3:
+        est_cicilan = input_nominal(
+            "Target Bayar Hutang / Bulan (Rp)",
+            value=2000000.0 if total_sisa_hutang > 0 else 0.0,
+            key="est_cicilan_3th",
+        )
+    with p4:
+        est_return = st.number_input(
+            "Estimasi Return Aset / Tahun (%)",
+            min_value=0.0,
+            max_value=30.0,
+            value=6.0,
+            step=0.5,
+            help="Contoh: RDPU/SBN sekitar 5–6.5% per tahun.",
+        )
+
+    df_proyeksi = hitung_proyeksi_3_tahun(
+        aset_awal=total_saldo_akhir,
+        hutang_awal=total_sisa_hutang,
+        pendapatan_bln=est_pendapatan,
+        pengeluaran_bln=est_pengeluaran,
+        cicilan_bln=est_cicilan,
+        return_tahunan_persen=est_return,
+    )
+
+    akhir_3th = df_proyeksi.iloc[-1]
+    k1, k2, k3 = st.columns(3)
+    k1.metric("💵 Proyeksi Total Aset (Tahun ke-3)", format_rp(akhir_3th["Total Aset"]))
+    k2.metric("🧾 Proyeksi Sisa Hutang (Tahun ke-3)", format_rp(akhir_3th["Sisa Hutang"]))
+    k3.metric("💎 Proyeksi Kekayaan Bersih (Tahun ke-3)", format_rp(akhir_3th["Kekayaan Bersih"]))
+
+    fig_tren = px.line(
+        df_proyeksi,
+        x="Periode",
+        y=["Total Aset", "Sisa Hutang", "Kekayaan Bersih"],
+        markers=False,
+        title="Tren Proyeksi Aset, Hutang & Kekayaan Bersih (36 Bulan)",
+        labels={"value": "Nominal (Rp)", "variable": "Indikator"},
+    )
+    fig_tren.update_layout(hovermode="x unified", legend_title_text="")
+    st.plotly_chart(fig_tren, use_container_width=True)
+
+    with st.expander("Lihat Tabel Ringkasan per Tahun (Tahun 0, 1, 2, 3)"):
+        df_tahunan = df_proyeksi[df_proyeksi["Bulan Ke"].isin([0, 12, 24, 36])].copy()
+        df_tahunan["Tahun"] = ["Saat Ini", "Tahun ke-1", "Tahun ke-2", "Tahun ke-3"]
+        for kol in ["Total Aset", "Sisa Hutang", "Kekayaan Bersih"]:
+            df_tahunan[kol] = df_tahunan[kol].map(format_rp)
+        st.dataframe(
+            df_tahunan[["Tahun", "Periode", "Total Aset", "Sisa Hutang", "Kekayaan Bersih"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    st.subheader("🤖 Analisis & Strategi Keuangan oleh Gemini AI")
+    st.caption("Gemini akan menganalisis posisi aset, hutang, arus kas, dan proyeksi 3 tahun akun ini.")
+
+    if st.button("✨ Minta Analisis Gemini AI", type="primary"):
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+        if not api_key:
+            st.error(
+                "Kunci `GEMINI_API_KEY` belum ditemukan di `.streamlit/secrets.toml` (atau menu Secrets Streamlit Cloud). "
+                "Tambahkan dulu `GEMINI_API_KEY = \"...\"` ya!"
+            )
+        else:
+            with st.spinner("Gemini sedang menganalisis data keuangan dan tren 3 tahun..."):
+                try:
+                    ringkasan_aset_str = (
+                        df_aset.groupby("jenis_saldo")["saldo_saat_ini"].sum().to_dict()
+                        if not df_aset.empty
+                        else {}
+                    )
+                    ringkasan_hutang_str = (
+                        df_hutang.assign(
+                            sisa=(df_hutang["total_hutang"] - df_hutang["sudah_dibayar"]).clip(lower=0)
+                        )
+                        .groupby("jenis_hutang")["sisa"]
+                        .sum()
+                        .to_dict()
+                        if not df_hutang.empty
+                        else {}
+                    )
+
+                    prompt_ai = f"""
+Kamu adalah perencana keuangan pribadi profesional di Indonesia.
+Analisis kondisi keuangan akun '{CURRENT_USER}' berikut ini secara jelas, praktis, dan terstruktur dalam bahasa Indonesia:
+
+DATA SAAT INI:
+- Total Aset Saat Ini: {format_rp(total_saldo_akhir)}
+- Rincian Aset per Jenis: {ringkasan_aset_str}
+- Total Sisa Hutang Saat Ini: {format_rp(total_sisa_hutang)}
+- Rincian Hutang per Jenis: {ringkasan_hutang_str}
+- Kekayaan Bersih Saat Ini: {format_rp(kekayaan_bersih)}
+
+ASUMSI BULANAN & PROYEKSI 3 TAHUN (36 BULAN):
+- Estimasi Pendapatan/bulan: {format_rp(est_pendapatan)}
+- Estimasi Pengeluaran/bulan: {format_rp(est_pengeluaran)}
+- Target Cicilan Hutang/bulan: {format_rp(est_cicilan)}
+- Estimasi Return Investasi/tahun: {est_return}%
+- Proyeksi Aset Tahun ke-3: {format_rp(akhir_3th['Total Aset'])}
+- Proyeksi Sisa Hutang Tahun ke-3: {format_rp(akhir_3th['Sisa Hutang'])}
+- Proyeksi Kekayaan Bersih Tahun ke-3: {format_rp(akhir_3th['Kekayaan Bersih'])}
+
+Berikan analisis dalam 4 bagian singkat:
+1. **Kesehatan Keuangan Saat Ini** (rasio hutang terhadap aset & arus kas bulanan).
+2. **Evaluasi Tren 3 Tahun ke Depan** (apakah pertumbuhannya sehat atau ada risiko defisit/hutang menumpuk).
+3. **3 Langkah Strategis Konkret** yang bisa langsung dilakukan bulan ini.
+4. **Saran Alokasi Investasi / Pelunasan Hutang** yang realistis.
+"""
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model="gemini-3.5-flash",
+                        contents=prompt_ai,
+                    )
+                    st.markdown(response.text)
+                except Exception as e:
+                    st.error(f"Gagal memanggil Gemini AI: {e}")
